@@ -1,0 +1,7 @@
+Sprite
+{
+	$baseTexture "editor/ts2do/game_score"
+	$spriteorientation "vp_parallel"
+	$spriteorigin "[.5 .5]"
+	$no_fullbright 1
+}

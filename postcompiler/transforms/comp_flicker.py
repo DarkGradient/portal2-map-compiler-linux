@@ -1,0 +1,122 @@
+"""Fires on/off inputs repeatedly to simulate a flicker-on effect."""
+from typing import Final
+
+from srctools import Output, lerp, logger, conv_float
+from hammeraddons.bsp_transform.common import strip_cust_keys, rng_get
+from hammeraddons.bsp_transform import trans, Context
+
+LOGGER = logger.get_logger(__name__)
+INP_TURN_OFF: Final = 'FireUser1'
+OUT_TURN_OFF: Final = 'OnUser1'
+INP_TURN_ON: Final = 'FireUser2'
+OUT_TURN_ON: Final = 'OnUser2'
+
+INP_FLICK_OFF: Final = 'FireUser3'
+OUT_FLICK_OFF: Final = 'OnUser3'
+INP_FLICK_ON: Final = 'FireUser4'
+OUT_FLICK_ON: Final = 'OnUser4'
+
+
+@trans('comp_flicker')
+def comp_flicker(ctx: Context) -> None:
+    """When triggered, fires on/off inputs repeatedly to simulate a flicker-on effect."""
+    for ent in ctx.vmf.by_class['comp_flicker']:
+        ent['classname'] = 'info_target'
+        ent_name = ent['targetname']
+
+        total_time = conv_float(ent['total_time'], 1.5)
+        flicker_min = max(conv_float(ent['flicker_min'], 0.05), 0.01)
+        flicker_max = max(conv_float(ent['flicker_max'], 0.3), 0.01)
+        variance = conv_float(ent['variance'])
+
+        ctx.add_io_remap(
+            ent_name,
+            Output('TurnOff', ent_name, INP_TURN_OFF),
+            Output('TurnOn', ent_name, INP_TURN_ON),
+            Output('FlickerOff', ent_name, INP_FLICK_OFF),
+            Output('FlickerOn', ent_name, INP_FLICK_ON),
+        )
+
+        for out in ent.outputs:
+            match out.output.casefold():
+                case 'onuser1' | 'onuser2' | 'onuser3' | 'onuser4':
+                    LOGGER.warning(
+                        'comp_flicker "{}" uses Fire/OnUserX outputs, which are being used by the '
+                        "entity logic! It probably won't work properly.",
+                        ent_name,
+                    )
+                case 'onturnedoff':
+                    out.output = OUT_TURN_OFF
+                case 'onturnedon':
+                    out.output = OUT_TURN_ON
+                case 'onflickeroffstart':
+                    out.output = OUT_FLICK_OFF
+                case 'onflickeronstart':
+                    out.output = OUT_FLICK_ON
+                case 'onflickeroffend':
+                    out.output = OUT_FLICK_OFF
+                    out.delay += total_time
+                case 'onflickeronend':
+                    out.output = OUT_FLICK_ON
+                    out.delay += total_time
+                case _:
+                    LOGGER.warning(
+                        'Unknown comp_flicker output "{}" for "{}"',
+                        out.output, ent_name,
+                    )
+
+        mdl_name = ent['target_mdl']
+        if mdl_name:
+            ent.add_out(
+                Output(OUT_TURN_ON, mdl_name, 'Skin', ent['mdl_skin_on']),
+                Output(OUT_TURN_OFF, mdl_name, 'Skin', ent['mdl_skin_off']),
+            )
+        rng = rng_get('comp_flicker', ent)
+
+        strip_cust_keys(ent)
+
+        for out_name, start_state, min_point, max_point in [
+            (OUT_FLICK_ON, False, 0.0, total_time),
+            (OUT_FLICK_OFF, True, total_time, 0.0),
+        ]:
+            time = 0.0
+            state = start_state
+            limit = 0
+            while time < total_time:
+                state = not state
+                ent.add_out(Output(
+                    out_name, '!self',
+                    INP_TURN_ON if state else INP_TURN_OFF,
+                    delay=time,
+                ))
+
+                delay = lerp(time, min_point, max_point, flicker_min, flicker_max)
+                time += delay + rng.uniform(-variance, variance)
+
+                delay = lerp(
+                    time,
+                    min_point, max_point,
+                    flicker_min, flicker_max,
+                )
+                # Clamp to specified min/max.
+                delay = min(flicker_max, max(flicker_min, delay)) + rng.uniform(-variance, variance)
+                # And enforce monotonicity.
+                if delay < 0.01:
+                    delay = 0.01
+
+                time += delay
+                limit += 1
+                if limit > 1000:
+                    LOGGER.warning(
+                        'Aborting delay computation for "{}", computed:\n{}', 
+                        ent_name, 
+                        [out.delay for out in ent.outputs],
+                    )
+                    break
+
+            # Force on exactly at the end time.
+            ent.add_out(Output(
+                out_name, '!self',
+                INP_TURN_OFF if start_state else INP_TURN_ON,
+                delay=time,
+            ))

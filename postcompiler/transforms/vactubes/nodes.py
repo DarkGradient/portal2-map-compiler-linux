@@ -1,0 +1,681 @@
+"""Implements the various curve types for vactubes."""
+from typing import ClassVar, Final, assert_never
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
+from enum import Enum
+import math
+import bisect
+import random
+
+import srctools.logger
+from srctools import Vec, Entity, VMF, Output, conv_bool, Matrix, lerp
+
+from hammeraddons.bsp_transform.common import RelayOut
+
+
+LOGGER = srctools.logger.get_logger(__name__)
+CUBE_MODEL = 'models/props/metal_box.mdl'
+# A bit smaller than the size of the model, so we can determine when to
+# start/stop showing ents on the screen.
+SCANNER_LENGTH = 80
+
+# A list of the models the geocable transform generated.
+SPLINES: list['Spline'] = []
+
+
+def make_standard_cube(vmf: VMF) -> Entity:
+    """Create a regular cube."""
+    return vmf.create_ent(
+        'prop_weighted_cube',
+        angles='0 0 0',
+        newskins='1',
+        skintype='0',
+        cubetype='0',
+        skin='0',
+        paintpower='4',
+        model=CUBE_MODEL,
+    )
+
+
+class DestType(Enum):
+    """The position of the output from a node.."""
+    PRIM = PRIMARY = 'primary'
+    SEC = SECONDARY = 'secondary'
+    TER = TERTIARY = 'tertiary'
+    OUT = PRIMARY
+
+    @property
+    def manual_targ(self) -> str:
+        """The name of the manual target keyvalue."""
+        match self.value:
+            case 'primary':
+                return 'target'
+            case 'secondary':
+                return 'target_sec'
+            case 'tertiary':
+                return 'target_tri'
+            case never:
+                assert_never(never)
+
+
+def curve_point(radius: float, t: float) -> tuple[float, float]:
+    """Compute the offset along a curve, in XY.
+
+    The curve goes from the [1, 0] direction to the [0, 1] direction.
+    It starts at 0,0 and ends at 1, 1.
+    """
+    ang = math.pi * t / 2.0
+    return radius * math.sin(ang), radius - radius * math.cos(ang)
+
+
+class Node(ABC):
+    """A node is a junction or curve in the track.
+
+    This also defines the behaviour of the point.
+
+    This has up to 3 output connections, depending on type.
+    """
+    # The name of the output fired when cubes pass this.
+    pass_out_name: ClassVar[str] = 'onpass'
+    # The outputs the item can use.
+    out_types: ClassVar[Iterable[DestType]] = ()
+    # If OnPass is present, use this relay for the input.
+    pass_relay: RelayOut | None
+    outputs: dict[DestType, 'Node | None']
+    # All nodes have an offset, but only EntityNodes have orientation
+    origin: Vec
+    is_skybox: bool  # If set, this is 1/16 scaled.
+
+    def __init__(self, origin: Vec, is_skybox: bool) -> None:
+        self.origin = origin
+        self.has_input = False  # We verify every node has an input if used.
+        # DestType -> output.
+        self.outputs = dict.fromkeys(self.out_types, None)
+        # Outputs fired when cubes reach this point.
+        self.pass_relay = None
+        self.is_skybox = is_skybox
+
+    @property  # TODO: ReadOnly[]
+    @abstractmethod
+    def name(self) -> str:
+        """The name of the entity."""
+        raise NotImplementedError
+
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} "{self.name}">'
+
+    @abstractmethod
+    def path_len(self, dest: DestType = DestType.PRIMARY) -> float:
+        """Return the length of the track for this node.
+
+        If zero, it's just a point position.
+        """
+        raise NotImplementedError(self)
+
+    def vec_point(self, t: float, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Return the position of the track.
+
+        T=0 means the start, T=1 is the end.
+        """
+        raise NotImplementedError(self)
+
+    @abstractmethod
+    def input_norm(self) -> Vec:
+        """Return the flow direction at the input point."""
+        raise NotImplementedError(self)
+
+    @abstractmethod
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Return the flow direction at the output node."""
+        raise NotImplementedError(self)
+
+
+class EntityNode(Node, ABC):
+    """Common functionality for nodes that are composed of a single entity."""
+    # If true, keep the entity around regardless. User4 is reserved for the pass output.
+    keep_ent: ClassVar[bool] = False
+
+    # Local position of the node.
+    matrix: Matrix
+
+    def __init__(self, ent: Entity, relay_maker: Iterator[RelayOut], is_skybox: bool) -> None:
+        super().__init__(Vec.from_str(ent['origin']), is_skybox)
+        self.matrix = Matrix.from_angstr(ent['angles'])
+        self.ent = ent
+
+        for out in ent.outputs:
+            if out.output.casefold() == self.pass_out_name:
+                if self.pass_relay is None:
+                    self.pass_relay = next(relay_maker)
+                out.output = self.pass_relay.output
+                self.pass_relay.ent.add_out(out)
+
+        if not self.keep_ent:
+            ent.remove()
+
+    @property
+    def name(self) -> str:
+        """The name of the entity."""
+        return self.ent['targetname']
+
+    def __repr__(self) -> str:
+        return (
+            f'<{self.__class__.__name__} "{self.name}" '
+            f'@ {self.origin}, {self.matrix.to_angle()}>'
+        )
+
+    def path_len(self, dest: DestType = DestType.PRIMARY) -> float:
+        """Return the length of the track for this node.
+
+        If zero, it's just a point position.
+        """
+        dist = self._path_len(dest)
+        return dist / 16.0 if self.is_skybox else dist
+
+    def vec_point(self, t: float, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Automatically apply position transform plus skybox."""
+        local = self._vec_point(t, dest)
+        if self.is_skybox:
+            local /= 16.0
+        return local @ self.matrix + self.origin
+
+    @abstractmethod
+    def _path_len(self, dest: DestType, /) -> float:
+        """Return the length of the track for this node.
+
+        If zero, it's just a point position.
+        """
+        raise NotImplementedError(self)
+
+    @abstractmethod
+    def _vec_point(self, t: float, dest: DestType, /) -> Vec:
+        """Return the position of the track, in local space.
+
+        T=0 means the start, T=1 is the end.
+        """
+        raise NotImplementedError(self)
+
+
+def parse(vmf: VMF, relay_maker: Iterator[RelayOut]) -> Iterator[Node]:
+    """Parse out all the vactube nodes from the VMF."""
+    for ent in vmf.by_class['comp_vactube_start']:
+        yield Spawner(
+            ent, relay_maker,
+            is_skybox=ent['model'].casefold() == "models/editor/vactubes/start_point_sky.mdl",
+        )
+
+    for ent in vmf.by_class['comp_vactube_end']:
+        cube_radius = srctools.conv_float(ent['radius'])
+        if cube_radius > 0:
+            yield Dropper.parse(vmf, ent, relay_maker, cube_radius)
+        else:
+            yield Destroyer(
+                ent, relay_maker,
+                is_skybox=ent['model'].casefold() == "models/editor/vactubes/end_point_sky.mdl",
+            )
+
+    for ent in vmf.by_class['comp_vactube_junction']:
+        is_reversed = srctools.conv_int(ent['skin']) == 1
+
+        orig_mdl = model = ent['model'].casefold()
+        del ent['model']
+        model = model.removeprefix('models/editor/vactubes/')
+        if model == orig_mdl:
+            raise ValueError(
+                f'Model "{orig_mdl}" is not a valid vactube '
+                f'junction type (at {ent["origin"]})'
+            )
+        model = model.removesuffix(".mdl")
+        if is_skybox := model.endswith('_sky'):
+            model = model.removesuffix('_sky')
+        match model:
+            case "straight":
+                yield Straight(ent, relay_maker, is_skybox)
+            case "diag_curve":
+                yield DiagCurve(
+                    ent, relay_maker, is_skybox=is_skybox,
+                    reversed=is_reversed, flipped=False,
+                )
+            case "diag_curve_mirror":
+                yield DiagCurve(
+                    ent, relay_maker, is_skybox=is_skybox,
+                    reversed=is_reversed, flipped=True,
+                )
+            case _ if model.startswith("curve_") and model[6:].isdigit():
+                # Each curve has a 64 units wider radius. Parse the model,
+                # so users can add larger curves if they want.
+                ind = int(model[6:])
+                yield Curve(ent, relay_maker, is_skybox, 64.0 * ind, is_reversed)
+            case "splitter_straight":
+                yield Splitter(ent, relay_maker, is_skybox=is_skybox, straight=True)
+            case "splitter_sides":
+                yield Splitter(ent, relay_maker, is_skybox=is_skybox, straight=False)
+            case "splitter_triple":
+                yield CrossSplitter(ent, relay_maker, is_skybox)
+            case _:
+                raise ValueError(
+                    f'Model "{orig_mdl}" is not a valid vactube '
+                    f'junction type (at {ent["origin"]})'
+                )
+    yield from SPLINES
+
+
+class Spawner(EntityNode):
+    """The start point of the track."""
+    pass_out_name = 'onspawned'
+    keep_ent = True
+    out_types: ClassVar[Iterable[DestType]] = [DestType.PRIMARY]
+
+    def __init__(self, ent: Entity, relay_maker: Iterator[RelayOut], is_skybox: bool) -> None:
+        super().__init__(ent, relay_maker, is_skybox)
+        self.group = ent.pop('group').casefold().strip()
+        self.speed = srctools.conv_float(ent.pop('speed'), 800.0)
+        if is_skybox:
+            self.speed /= 16.0
+        timer_int = srctools.conv_int(ent.pop('timer'), 1)
+        self.is_auto = timer_int != 0
+        self.seed = ent.pop('seed')
+        if not self.seed:
+            # Generate a new seed, and notify the user, so they can copy it down
+            # if they want to use it themselves.
+            self.seed = format(random.getrandbits(64), '08X')
+        LOGGER.info('Spawner "{}" using random seed "{}"', self.name, self.seed)
+
+        if self.is_auto:
+            self.time_min = srctools.conv_float(ent.pop('time_min'), 0.5)
+            self.time_max = srctools.conv_float(ent.pop('time_max'), 1.0)
+            self.timer_start_disabled = timer_int == 2
+        else:
+            self.time_min = self.time_max = 0.0
+            self.timer_start_disabled = True
+            # Strip the keyvalues.
+            del ent['time_min'], ent['time_max']
+
+        # Store these keyvalues, to be set on the visual prop.
+        self.prop_fast_reflection = srctools.conv_bool(ent.pop('prop_fast_reflection'))
+        self.prop_disable_shadows = srctools.conv_bool(ent.pop('prop_disable_shadows'), True)
+        self.prop_disable_projtex = srctools.conv_bool(ent.pop('prop_disable_projtex'))
+
+    def _vec_point(self, t: float, dest: DestType) -> Vec:
+        assert dest is DestType.PRIMARY, self
+        return Vec()
+
+    def _path_len(self, dest: DestType) -> float:
+        assert dest is DestType.PRIMARY, self
+        return 0.0
+
+    def input_norm(self) -> Vec:
+        raise AssertionError(self)
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        assert dest is DestType.PRIMARY
+        return Vec(x=1) @ self.matrix
+
+
+class Destroyer(EntityNode):
+    """The end of the track."""
+    pass_out_name = 'oncubearrived'
+    out_types: ClassVar[Iterable[DestType]] = []
+
+    def _vec_point(self, t: float, dest: DestType) -> Vec:
+        assert dest is DestType.PRIMARY
+        return Vec()
+
+    def _path_len(self, dest: DestType) -> float:
+        assert dest is DestType.PRIMARY
+        return 0.0
+
+    def input_norm(self) -> Vec:
+        return Vec(x=-1) @ self.matrix
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Destroyers have no outputs."""
+        raise AssertionError(self)
+
+
+class Spline(Node):
+    """Special node matching a model generated by the geocable transform."""
+    out_types: ClassVar[Iterable[DestType]] = [DestType.PRIMARY]
+    _vmf = VMF()
+
+    def __init__(self, origin: Vec, name: str, points: list[Vec]) -> None:
+        # Create a dummy entity, we don't really need it.
+        super().__init__(origin, is_skybox=False)  # TODO skybox?
+        assert len(points) >= 2, 'Not enough points!'
+        self.start_norm = (points[1] - points[0]).norm()
+        self.end_norm = (points[-1] - points[-2]).norm()
+
+        self.points = points
+        self._name = name
+        length = 0.0
+        # Accumulate the lengths, so we can interpolate.
+        self.lengths = []
+        last_pos = points[0]
+        for pos in points:
+            length += (pos - last_pos).mag()
+            self.lengths.append(length)
+            last_pos = pos
+        self.length = length
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def path_len(self, dest: DestType = DestType.PRIMARY) -> float:
+        """Return the total length of this path."""
+        assert dest is DestType.PRIMARY
+        return self.length
+
+    def vec_point(self, t: float, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Given an interpolation point between 0-1, find the location at that point."""
+        assert dest is DestType.PRIMARY
+        dist = self.length * t
+        i = bisect.bisect_left(self.lengths, dist)
+        pos1, len1 = self.points[i], self.lengths[i]
+        try:
+            pos2, len2 = self.points[i+1], self.lengths[i+1]
+        except IndexError:  # End of list.
+            return self.origin + pos1
+        return self.origin + Vec(
+            lerp(dist, len1, len2, pos1.x, pos2.x),
+            lerp(dist, len1, len2, pos1.y, pos2.y),
+            lerp(dist, len1, len2, pos1.z, pos2.z),
+        )
+
+    def input_norm(self) -> Vec:
+        """Return the direction of the input side."""
+        return self.start_norm.copy()
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """return the direction of the output side."""
+        assert dest is DestType.PRIMARY
+        return self.end_norm.copy()
+
+
+class Dropper(Destroyer):
+    """The endpoint which is linked to/controls a dropper."""
+
+    def __init__(
+        self, ent: Entity, relay_maker: Iterator[RelayOut],
+        is_skybox: bool, temp: Entity, cube: Entity,
+    ) -> None:
+        super().__init__(ent, relay_maker, is_skybox)
+        self.template = temp
+        self.cube = cube
+
+    @classmethod
+    def parse(cls, vmf: VMF, ent: Entity, relay_maker: Iterator[RelayOut], radius: float) -> 'Dropper':
+        """Scan the map applying dropper tweaks, then create the Dropper object."""
+        filter_name = ent['filtername']
+        template_name = ent['template']
+        is_skybox = ent['model'].casefold() == "models/editor/vactubes/end_point_sky.mdl"
+
+        for cube_filter in vmf.search(filter_name):
+            break
+        else:
+            raise ValueError(f'No filter "{filter_name}" for dropper at {ent["origin"]}!')
+
+        for template in vmf.search(template_name):
+            break
+        else:
+            raise ValueError(f'No template "{template_name}" for dropper at {ent["origin"]}!')
+
+        best_cube = None
+        best_dist = math.inf
+        radius **= 2
+        ref_pos = Vec.from_str(cube_filter['origin'])
+        for cube in vmf.by_class['prop_weighted_cube'] | vmf.by_class['prop_monster_box']:
+            dist = (Vec.from_str(cube['origin']) - ref_pos).mag_sq()
+            if dist > radius or dist > best_dist:
+                continue
+            best_dist = dist
+            best_cube = cube
+        if best_cube is None:
+            LOGGER.warning('Cube dropper at {} has no cube. Generating standard one...', ref_pos)
+            best_cube = make_standard_cube(vmf)
+
+        # Now adjust the cube for dropper use.
+        best_cube.make_unique('dropper_cube')
+        best_cube['origin'] = ent['origin']
+        # Only regular cubes can disable funnelling, but frankenturrets
+        # require being in box form.
+        if best_cube['classname'] == 'prop_monster_box':
+            best_cube['startasbox'] = '1'
+        else:
+            best_cube['allowfunnel'] = '0'
+
+        # Copy the cube name to filter and dropper.
+        cube_filter['filtername'] = best_cube['targetname']
+
+        for i in range(1, 10):
+            if not template[f'Template{i:02}']:
+                template[f'Template{i:02}'] = best_cube['targetname']
+            break
+        else:
+            raise ValueError(f'No spare slots for template "{template_name}"!')
+
+        # Add fizzle outputs if enabled.
+        if srctools.conv_bool(ent['autorespawn']):
+            best_cube.outputs += [
+                out for out in ent.outputs
+                if out.output.casefold() == 'onfizzled'
+            ]
+        ent.add_out(Output(Dropper.pass_out_name, template, 'ForceSpawn'))
+        return Dropper(ent, relay_maker, is_skybox, template, best_cube,)
+
+
+class Curve(EntityNode):
+    """A simple corner node."""
+    out_types: ClassVar[Iterable[DestType]] = [DestType.PRIMARY]
+
+    def __init__(
+        self, ent: Entity, relay_maker: Iterator[RelayOut],
+        is_skybox: bool, radius: float, reversed: bool,
+    ) -> None:
+        super().__init__(ent, relay_maker, is_skybox)
+        self.radius = radius
+        self.reversed = reversed
+
+    def _path_len(self, dest: DestType) -> float:
+        """Return the length of the curve."""
+        assert dest is DestType.PRIMARY
+        # πD / 4
+        return math.pi * (2.0 / 4.0) * self.radius
+
+    def _vec_point(self, t: float, dest: DestType) -> Vec:
+        """Return the position along the curve."""
+        assert dest is DestType.PRIMARY
+
+        if self.reversed:
+            t = 1.0 - t
+
+        x, y = curve_point(self.radius, t)
+        return Vec(0, x, -y)
+
+    def input_norm(self) -> Vec:
+        if self.reversed:
+            return Vec(z=1) @ self.matrix
+        else:
+            return Vec(y=1) @ self.matrix
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Return the flow direction at the end of this curve type."""
+        assert dest is DestType.PRIMARY
+        if self.reversed:
+            return Vec(y=-1) @ self.matrix
+        else:
+            return Vec(z=-1) @ self.matrix
+
+
+class DiagCurve(EntityNode):
+    """A 45 degree curve.
+
+    This has a lot of precise constants to match a specific model.
+    """
+    out_types: ClassVar[Iterable[DestType]] = [DestType.PRIMARY]
+    CURVE_LEN: Final = 155.0  # Manually integrated the curve function.
+    STRAIGHT_LEN: Final = 56.0
+    TOTAL_LEN: Final = CURVE_LEN + STRAIGHT_LEN
+    STRAIGHT_PERC: Final = STRAIGHT_LEN / TOTAL_LEN
+
+    def __init__(
+        self, ent: Entity, relay_maker: Iterator[RelayOut],
+        *, is_skybox: bool, reversed: bool, flipped: bool,
+    ) -> None:
+        super().__init__(ent, relay_maker, is_skybox)
+        self.reversed = reversed
+        # If flipped, we just want to flip the sign of the Y coord.
+        self.y = -1.0 if flipped else 1.0
+
+    def _path_len(self, dest: DestType) -> float:
+        """Return the length of the curve."""
+        assert dest is DestType.PRIMARY
+        return self.TOTAL_LEN
+
+    def _vec_point(self, t: float, dest: DestType) -> Vec:
+        """Return the position along the curve."""
+        assert dest is DestType.PRIMARY
+        if self.reversed:
+            t = 1.0 - t
+
+        if t < self.STRAIGHT_PERC:
+            x = 0.0
+            y = lerp(t, 0.0, self.STRAIGHT_PERC, 128, 72)
+        else:
+            ang = lerp(t, self.STRAIGHT_PERC, 1.0, 0.0, math.pi/4)
+            x = lerp(math.cos(ang), 1.0, math.cos(math.pi/4), 0, 64)
+            y = lerp(math.sin(ang), 0.0, math.sin(math.pi/4), 72, -64)
+
+        return Vec(x, self.y * y, 0)
+
+    def input_norm(self) -> Vec:
+        """Return the flow direction into the start of the curve."""
+        if self.reversed:
+            return Vec(x=-1, y=self.y).norm() @ self.matrix
+        else:
+            return Vec(y=-self.y) @ self.matrix
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Return the flow direction at the end of the curve."""
+        assert dest is DestType.PRIMARY
+        if self.reversed:
+            return Vec(y=self.y) @ self.matrix
+        else:
+            return Vec(x=1, y=-self.y).norm() @ self.matrix
+
+
+class Straight(EntityNode):
+    """A node pointing directly straight, for outputting or the like.
+
+    This also checks for TV scanners being present nearby.
+    """
+    out_types: ClassVar[Iterable[DestType]] = [DestType.PRIMARY]
+
+    def __init__(self, ent: Entity, relay_maker: Iterator[RelayOut], is_skybox: bool) -> None:
+        """Convert the entity to have the right logic."""
+        self.persist_tv = conv_bool(ent.pop('persist_tv', False))
+        super().__init__(ent, relay_maker, is_skybox)
+
+    def _path_len(self, dest: DestType) -> float:
+        """Return the length of this node, which is always 32 units (arbitrarily)."""
+        assert dest is DestType.PRIMARY
+        return 32.0
+
+    def _vec_point(self, t: float, dest: DestType) -> Vec:
+        """Return points along the path inside this node."""
+        assert dest is DestType.PRIMARY
+        return Vec(x=32.0*t - 16.0)
+
+    def input_norm(self) -> Vec:
+        """Return the flow direction into the start of this node."""
+        return Vec(x=1.0) @ self.matrix
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Return the flow direction at the end of this curve type."""
+        assert dest is DestType.PRIMARY
+        return Vec(x=1.0) @ self.matrix
+
+
+class Splitter(EntityNode):
+    """A T-intersection that outputs straight and to the side."""
+    out_types: ClassVar[Iterable[DestType]] = [DestType.PRIMARY, DestType.SECONDARY]
+
+    def __init__(
+        self, ent: Entity, relay_maker: Iterator[RelayOut],
+        *, is_skybox: bool, straight: bool,
+    ) -> None:
+        """If straight is true, the primary dir goes forward, otherwise it's off to the side."""
+        super().__init__(ent, relay_maker, is_skybox)
+        self.is_straight = straight
+
+    def _path_len(self, dest: DestType) -> float:
+        if self.is_straight and dest is DestType.PRIMARY:
+            return 128.0
+        else:
+            return 64.0 / 4.0 * math.pi
+
+    def _vec_point(self, t: float, dest: DestType) -> Vec:
+        assert dest is not DestType.TERTIARY
+        x, y = curve_point(64.0, t)
+        if dest is DestType.SECONDARY:
+            return Vec(y, x, 0)
+        elif self.is_straight:
+            return Vec(y=128*t)
+        else:
+            return Vec(-y, x, 0)
+
+    def input_norm(self) -> Vec:
+        """Return the flow direction at the input side."""
+        return Vec(y=1) @ self.matrix
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Return the flow direction at the end of this curve type."""
+        if dest is DestType.SECONDARY:
+            return Vec(x=1) @ self.matrix
+        else:
+            assert dest is DestType.PRIMARY
+            if self.is_straight:
+                return Vec(y=1) @ self.matrix
+            else:
+                return Vec(x=-1) @ self.matrix
+
+
+class CrossSplitter(EntityNode):
+    """An X-intersection that outputs forward and to the side
+
+    Primary is left, secondary is forward, tertiary is right.
+    """
+    out_types: ClassVar[Iterable[DestType]] = [DestType.PRIMARY, DestType.SECONDARY, DestType.TERTIARY]
+
+    def _path_len(self, dest: DestType) -> float:
+        if dest is DestType.SECONDARY:  # Straight through
+            return 128.0
+        else:  # Either curve
+            return 64.0 / 4.0 * math.pi
+
+    def _vec_point(self, t: float, dest: DestType) -> Vec:
+        """Return the position this far through the given curve."""
+        x, y = curve_point(64.0, t)
+        if dest is DestType.PRIMARY:
+            return Vec(y, x, 0)
+        elif dest is DestType.SECONDARY:
+            return Vec(y=128*t)
+        elif dest is DestType.TERTIARY:
+            return Vec(-y, x, 0)
+        else:
+            raise AssertionError(dest)
+
+    def input_norm(self) -> Vec:
+        """Return the flow direction at the input side."""
+        return Vec(y=1) @ self.matrix
+
+    def output_norm(self, dest: DestType = DestType.PRIMARY) -> Vec:
+        """Return the flow direction at the end of this curve type."""
+        if dest is DestType.PRIMARY:
+            return Vec(x=1) @ self.matrix
+        elif dest is DestType.SECONDARY:
+            return Vec(y=1) @ self.matrix
+        elif dest is DestType.TERTIARY:
+            return Vec(x=-1) @ self.matrix
+        else:
+            raise AssertionError(dest)
