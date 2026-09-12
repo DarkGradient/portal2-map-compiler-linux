@@ -1,0 +1,2 @@
+JAVA_VERSION="24.0.2"
+MODULES="java.base java.datatransfer java.xml java.prefs java.desktop com.formdev.flatlaf java.logging com.github.weisj.jsvg com.formdev.flatlaf.extras com.miglayout.core com.miglayout.swing info.ata4.bspsrc.common info.ata4.ioutils org.apache.commons.codec org.apache.commons.io org.apache.commons.lang3 org.tukaani.xz org.apache.commons.compress org.apache.logging.log4j info.ata4.bspsrc.lib info.ata4.bspsrc.decompiler info.picocli java.compiler java.rmi java.scripting org.apache.logging.log4j.core info.ata4.bspsrc.app"

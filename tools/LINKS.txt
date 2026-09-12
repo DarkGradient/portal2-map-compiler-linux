@@ -1,0 +1,14 @@
+Tools ++
+https://ficool2.github.io/HammerPlusPlus-Website/tools.html
+
+Hammer ++
+https://ficool2.github.io/HammerPlusPlus-Website/download.html
+
+HammerAddons
+https://github.com/TeamSpen210/HammerAddons
+
+bspsrc
+https://github.com/ata4/bspsrc
+
+p2mappublisher
+https://github.com/Trico-Everfire/p2-publishing-tool
