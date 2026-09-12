@@ -1,0 +1,111 @@
+// ----------------------------------------------------------------------------------------
+// FGD for the ++ compiler suite
+// ----------------------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------------------
+// Base classes for new entities after this section
+// These will be removed when ExtendClass is fixed
+// ----------------------------------------------------------------------------------------
+@PointClass base(Light) = LightSpot :
+	"An invisible and directional spotlight."
+[
+	target(target_destination) : "Entity to point at" : : "The name of an entity in the map that the spotlight will point at. This will override the spotlight's angles."
+	_inner_cone(integer) : "Inner (bright) angle" : 30
+	_cone(integer) : "Outer (fading) angle" : 45
+	_exponent(integer) : "Focus" : 1
+	_distance(integer) : "Maximum distance" : 0 : "This is the distance that light is allowed to cast, in inches."
+	pitch(angle_negative_pitch) : "Pitch" : -90
+	spawnflags(Flags) = [ 1 : "Initially dark" : 0 ]
+]
+
+// ----------------------------------------------------------------------------------------
+// New entities
+// ----------------------------------------------------------------------------------------
+
+@SolidClass = func_detail_blocker : 
+	"A brush entity that prevents detail sprites from being placed inside its volume."
+[
+]
+
+@SolidClass color(0 180 0) = func_detail_illusionary : 
+	"Similar to func_detail, but non-solid."
+[
+	vbsp_nobevel(boolean) : "No Bevel" : "0" : "If set, bevel faces aren't emitted on angled geometry. This reduces brushsides at the cost of less accurate collision on corners."
+]
+
+@SolidClass = func_nobevel :
+	"Defines a region to not bevel collision, to reduce brushsides count. Only should be used in areas where players can't touch the brush"
+[
+]
+
+@PointClass base(Targetname, Angles) iconsprite("editor/light_env.vmt") = light_directional : 
+	"A directional light with no falloff. Similar to sunlight in light_environment."
+[
+	pitch(integer) : "Pitch" : 0 : "The downward pitch of the light from the sun. 0 is horizontal, -90 is straight down."
+		
+	_light(color255) : "Brightness" : "255 255 255 200"
+	_lightHDR(color255) : "Brightness HDR" : "-1 -1 -1 1"
+	_lightscaleHDR(float) : "Brightness Scale HDR" : "0.7" : "Amount to scale the light by when compiling for HDR."
+	SunSpreadAngle(float) : "Spread Angle" : 0 : "The angular extent of the light for casting soft shadows. Higher numbers are more diffuse. 5 is a good starting value."
+]
+
+@PointClass base(Targetname, Angles, LightSpot) lightprop("models/editor/spot.mdl") lightcone() sphere(_fifty_percent_distance) sphere(_zero_percent_distance) = light_projected :
+	"An invisible and directional spotlight that projects a texture, similar to env_projectedtexture but lightmapped"
+[
+	texturename(string)	: "Texture Name" : "effects/flashlight001" : "Texture to project"
+]
+
+// ----------------------------------------------------------------------------------------
+// Extensions
+//
+// You need to copy keyvalues from here into your own game's FGD to use them
+// (ExtendClass currently doesn't work correctly in Hammer)
+// ----------------------------------------------------------------------------------------
+
+//@ExtendClass = func_detail : 
+//	""
+//[
+//	vbsp_nobevel(boolean) : "No Bevel" : "0" : "If set, bevel faces aren't emitted on angled geometry. This reduces brushsides at the cost of less accurate collision on corners."
+//]
+
+//@ExtendClass = light :
+//	""
+//[
+//	_light_radius(float) : "Light Radius" : 0 : "Radius of the light for casting soft shadows (0 is hard shadows). Soft shadows take significantly longer to compile."
+//]
+
+//@ExtendClass = light_spot :
+//	""
+//[
+//	_light_radius(float) : "Light Radius" : 0 : "Radius of the light for casting soft shadows (0 is hard shadows). Soft shadows take significantly longer to compile."
+//]
+	
+//@ExtendClass = prop_dynamic :
+//	""
+//[
+//	vrad_model_cast_shadows(choices) : "VRAD Shadows" : 0 : "Set this if this brush casts VRAD static shadows. This disables dynamic shadows as well." =
+//	[
+//		0 : "No"
+//		1 : "Yes"
+//	]
+//]
+
+//@ExtendClass = prop_dynamic_override :
+//	""
+//[
+//	vrad_model_cast_shadows(choices) : "VRAD Shadows" : 0 : "Set this if this brush casts VRAD static shadows. This disables dynamic shadows as well." =
+//	[
+//		0 : "No"
+//		1 : "Yes"
+//	]
+//]
+
+//@ExtendClass = prop_static :
+//	"An invisible and directional spotlight that projects a texture, similar to env_projectedtexture but lightmapped"
+//[
+//	disableambientocclusion(choices) : "Disable Ambient Occlusion with vertex lighting" : 0 =
+//	[
+//		0 : "No"
+//		1 : "Yes"
+//	]
+//]

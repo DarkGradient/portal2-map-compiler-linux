@@ -6,6 +6,10 @@
 poll(), читать лог по мере роста файла. Это тот же принцип, что и в
 оригинальном run_step() из баша (фоновый процесс + цикл рендера), только
 без жёсткой связки с конкретным способом отображения.
+
+Все инструменты (vbsp++/vvis++/vrad++ из toolsplusplus и postcompiler) —
+нативные Linux-бинарники, запускаются напрямую, без wine и без конвертации
+путей в формат Z:\\...
 """
 
 from __future__ import annotations
@@ -15,11 +19,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
-
-
-def to_wine_path(path: Path) -> str:
-    """Аналог to_wine_path() из баша: /a/b/c -> Z:\\a\\b\\c"""
-    return "Z:" + str(path).replace("/", "\\")
 
 
 def fmt_time(seconds: int) -> str:
@@ -75,20 +74,18 @@ class StepHandle:
 
 def run_step(name: str, cmd: list[str], log_file: Path) -> StepHandle:
     """
-    Запускает команду в фоне (аналог `cmd >> log_file 2>&1 &` из баша).
-
-    Если первый элемент cmd оканчивается на .exe — оборачиваем в wine,
-    как и в оригинале (runner = wine, если cmd[0] == *.exe).
+    Запускает нативный бинарник в фоне (аналог `cmd >> log_file 2>&1 &` из баша).
     """
     real_cmd = list(cmd)
 
-    # Заглушаем весь внутренний отладочный спам Wine (fixme, err, warn и т.д.)
-    # Вывод самих утилит Valve (VBSP/VVIS/VRAD) при этом остаётся нетронутым.
     env = os.environ.copy()
-    env["WINEDEBUG"] = "-all"
-
-    if real_cmd and real_cmd[0].endswith(".exe"):
-        real_cmd = ["wine", *real_cmd]
+    if real_cmd:
+        bin_dir = str(Path(real_cmd[0]).resolve().parent)
+        # Некоторые сборки toolsplusplus поставляются с собственными .so
+        # рядом с бинарником — на всякий случай добавляем их каталог в поиск,
+        # чтобы не ловить "error while loading shared libraries" на чужой машине.
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{bin_dir}:{existing}" if existing else bin_dir
 
     log_fh = open(log_file, "ab")  # append-режим, как >> в баше
     process = subprocess.Popen(
